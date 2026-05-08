@@ -9,7 +9,7 @@ public sealed class TaskbarWidgetForm : Form
 
     private const int ClientWidthExtraPerAdditionalDrive = 44;
 
-    private const int WidgetHeight = 52;
+    private const int WidgetHeight = 60;
 
     private readonly Metrics _metrics = new();
     private readonly RingBuffer _cpu = new(60);
@@ -25,7 +25,12 @@ public sealed class TaskbarWidgetForm : Form
     private int _consecutiveTempMisses;
     private bool _showTemp;
 
+    private double? _cpuClockMhz;
+
     private readonly System.Windows.Forms.Timer _timer;
+
+    private static readonly Color BorderLine = Color.FromArgb(90, 255, 255, 255);
+    private static readonly Color LabelBrush = Color.FromArgb(170, 230, 230, 230);
 
     public TaskbarWidgetForm()
     {
@@ -115,9 +120,10 @@ public sealed class TaskbarWidgetForm : Form
 
     private void SampleAndRedraw()
     {
-        var (cpu, mem, tempC) = _metrics.Sample();
+        var (cpu, mem, tempC, cpuMhz) = _metrics.Sample();
         _cpu.Add(cpu);
         _mem.Add(mem);
+        _cpuClockMhz = cpuMhz;
 
         // Probe temps continually, but only display when reliably present.
         if (tempC is { } t)
@@ -177,17 +183,19 @@ public sealed class TaskbarWidgetForm : Form
         var inner = Rectangle.Inflate(ClientRectangle, -pad, -pad);
 
         var tempW = _showTemp ? 44 : 0;
-        var gap = 8;
-        var graphW = Math.Max(
-            54,
-            (inner.Width - tempW - (tempW > 0 ? gap : 0) - gap * 2) / 3);
+        const int tempPad = 4;
+        var stripW = inner.Width - tempW - (tempW > 0 ? tempPad : 0);
+        var w1 = stripW / 3;
+        var w2 = stripW / 3;
+        var w3 = stripW - w1 - w2;
 
-        var cpuRect = new Rectangle(inner.Left, inner.Top, graphW, inner.Height);
-        var memRect = new Rectangle(cpuRect.Right + gap, inner.Top, graphW, inner.Height);
-        var diskRect = new Rectangle(memRect.Right + gap, inner.Top, graphW, inner.Height);
-        var tempRect = new Rectangle(diskRect.Right + (tempW > 0 ? gap : 0), inner.Top, tempW, inner.Height);
+        var cpuRect = new Rectangle(inner.Left, inner.Top, w1, inner.Height);
+        var memRect = new Rectangle(cpuRect.Right, inner.Top, w2, inner.Height);
+        var diskRect = new Rectangle(memRect.Right, inner.Top, w3, inner.Height);
+        var tempRect = new Rectangle(diskRect.Right + (tempW > 0 ? tempPad : 0), inner.Top, tempW, inner.Height);
 
-        DrawGraph(g, cpuRect, _cpu.Snapshot(), Color.FromArgb(255, 90, 220, 90), "CPU");
+        var cpuSpeed = FormatCpuSpeed(_cpuClockMhz);
+        DrawGraph(g, cpuRect, _cpu.Snapshot(), Color.FromArgb(255, 90, 220, 90), "CPU", cpuSpeed);
         DrawGraph(g, memRect, _mem.Snapshot(), Color.FromArgb(255, 110, 160, 255), "RAM");
         DrawDiskGraph(g, diskRect, _diskSamples.Snapshot(), _disk);
 
@@ -202,8 +210,28 @@ public sealed class TaskbarWidgetForm : Form
             g.DrawString(s, f, br, x, y);
         }
 
-        using var border = new Pen(Color.FromArgb(90, 255, 255, 255));
-        g.DrawRectangle(border, 0, 0, ClientRectangle.Width - 1, ClientRectangle.Height - 1);
+        using (var rule = new Pen(BorderLine))
+        {
+            // Shared vertical edges only (no inner boxes around each graph).
+            if (memRect.Left > inner.Left)
+                g.DrawLine(rule, memRect.Left, inner.Top, memRect.Left, inner.Bottom);
+            if (diskRect.Left > memRect.Left)
+                g.DrawLine(rule, diskRect.Left, inner.Top, diskRect.Left, inner.Bottom);
+            if (tempW > 0 && tempRect.Left > diskRect.Right)
+                g.DrawLine(rule, tempRect.Left - 1, inner.Top, tempRect.Left - 1, inner.Bottom);
+        }
+
+        using var outer = new Pen(BorderLine);
+        g.DrawRectangle(outer, inner.Left, inner.Top, inner.Width - 1, inner.Height - 1);
+    }
+
+    private static string? FormatCpuSpeed(double? mhz)
+    {
+        if (mhz is not { } m || !double.IsFinite(m) || m < 200)
+            return null;
+        if (m >= 1000)
+            return $"{m / 1000.0:0.00} GHz";
+        return $"{m:0} MHz";
     }
 
     /// <summary>Third mini graph matching CPU/RAM; label shows rotating drive letter.</summary>
@@ -227,60 +255,82 @@ public sealed class TaskbarWidgetForm : Form
         DrawGraph(g, rect, series, color, label);
     }
 
-    private void DrawGraphUnavailable(Graphics g, Rectangle rect, string label)
+    private void DrawGraphUnavailable(Graphics g, Rectangle cell, string label)
     {
-        using var border = new Pen(Color.FromArgb(90, 255, 255, 255));
-        using var labelBrush = new SolidBrush(Color.FromArgb(170, 230, 230, 230));
+        using var labelBr = new SolidBrush(LabelBrush);
         using var muted = new SolidBrush(Color.FromArgb(120, 200, 200, 200));
-        g.DrawRectangle(border, rect);
-        var plot = Rectangle.Inflate(rect, -3, -3);
         using var f = new Font("Segoe UI", 7, FontStyle.Regular);
-        g.DrawString(label, f, labelBrush, plot.Left - 1, plot.Top - 2);
-        var na = "n/a";
-        var sz = g.MeasureString(na, f);
-        g.DrawString(na, f, muted, plot.Right - sz.Width, plot.Bottom - sz.Height);
+        var state = g.Save();
+        try
+        {
+            g.SetClip(cell);
+            g.DrawString(label, f, labelBr, cell.Left + 2, cell.Top + 2);
+            var na = "n/a";
+            var sz = g.MeasureString(na, f);
+            g.DrawString(na, f, muted, cell.Right - sz.Width - 2, cell.Bottom - sz.Height - 2);
+        }
+        finally
+        {
+            g.Restore(state);
+        }
     }
 
-    private void DrawGraph(Graphics g, Rectangle rect, double[] series, Color color, string label)
+    private void DrawGraph(Graphics g, Rectangle cell, double[] series, Color color, string label, string? subtitle = null)
     {
-        using var border = new Pen(Color.FromArgb(90, 255, 255, 255));
         using var linePen = new Pen(color, 2f);
-        using var labelBrush = new SolidBrush(Color.FromArgb(170, 230, 230, 230));
-
-        g.DrawRectangle(border, rect);
-
-        var plot = Rectangle.Inflate(rect, -3, -3);
-        plot.Height = Math.Max(10, plot.Height);
-
-        // Label (tiny)
+        using var labelBr = new SolidBrush(LabelBrush);
         using var f = new Font("Segoe UI", 7, FontStyle.Regular);
-        g.DrawString(label, f, labelBrush, plot.Left - 1, plot.Top - 2);
+        using var fSub = new Font("Segoe UI", 6.25f, FontStyle.Regular);
 
-        var n = Math.Min(series.Length, plot.Width);
-        if (n <= 1) return;
-
-        var tail = series[^n..];
-        PointF[] pts = new PointF[n];
-
-        float YFor(double pct)
+        var state = g.Save();
+        try
         {
-            var t = Math.Clamp(pct / 100.0, 0.0, 1.0);
-            return (float)(plot.Bottom - (t * plot.Height));
-        }
+            g.SetClip(cell);
 
-        for (int i = 0; i < n; i++)
+            float y = cell.Top + 2;
+            g.DrawString(label, f, labelBr, cell.Left + 2, y);
+            y += f.Height - 1;
+            if (subtitle != null)
+            {
+                g.DrawString(subtitle, fSub, labelBr, cell.Left + 2, y);
+                y += fSub.Height;
+            }
+
+            y += 1;
+            var plotBottom = cell.Bottom - 3 - f.Height;
+            if (plotBottom <= y + 4)
+                return;
+
+            var plot = Rectangle.FromLTRB(cell.Left + 1, (int)y, cell.Right - 1, plotBottom);
+
+            var n = Math.Min(series.Length, Math.Max(1, plot.Width));
+            if (n <= 1) return;
+
+            var tail = series[^n..];
+            var pts = new PointF[n];
+
+            float YFor(double pct)
+            {
+                var t = Math.Clamp(pct / 100.0, 0.0, 1.0);
+                return plot.Bottom - (float)(t * plot.Height);
+            }
+
+            for (int i = 0; i < n; i++)
+            {
+                var x = plot.Right - (n - 1 - i);
+                pts[i] = new PointF(x, YFor(tail[i]));
+            }
+
+            g.DrawLines(linePen, pts);
+
+            var latest = tail[^1];
+            var txt = $"{latest:0}%";
+            var sz = g.MeasureString(txt, f);
+            g.DrawString(txt, f, labelBr, plot.Right - sz.Width, plot.Bottom);
+        }
+        finally
         {
-            var x = plot.Right - (n - 1 - i);
-            pts[i] = new PointF(x, YFor(tail[i]));
+            g.Restore(state);
         }
-
-        g.DrawLines(linePen, pts);
-
-        // Current value text at bottom-right of plot (small)
-        var latest = tail[^1];
-        var txt = $"{latest:0}%";
-        var sz = g.MeasureString(txt, f);
-        g.DrawString(txt, f, labelBrush, plot.Right - sz.Width, plot.Bottom - sz.Height);
     }
 }
-

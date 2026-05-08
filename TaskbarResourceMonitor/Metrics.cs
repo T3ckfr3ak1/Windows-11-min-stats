@@ -12,6 +12,7 @@ internal sealed class Metrics : IDisposable
 
     private DateTime _nextHardwarePoll = DateTime.MinValue;
     private double? _lastTempC;
+    private double? _lastCpuClockMhz;
 
     public Metrics()
     {
@@ -28,7 +29,7 @@ internal sealed class Metrics : IDisposable
         try { _computer.Open(); } catch { /* optional */ }
     }
 
-    public (double cpu, double mem, double? tempC) Sample()
+    public (double cpu, double mem, double? tempC, double? cpuClockMhz) Sample()
     {
         var cpu = Safe(() => (double)_cpuCounter.NextValue(), 0);
         var mem = Safe(GetMemPercent, 0);
@@ -37,9 +38,39 @@ internal sealed class Metrics : IDisposable
         {
             _nextHardwarePoll = DateTime.UtcNow.AddSeconds(4);
             _lastTempC = TryGetTempC() ?? TryGetAcpiTempC();
+            _lastCpuClockMhz = TryGetCpuMaxClockMhz();
         }
 
-        return (cpu, mem, _lastTempC);
+        return (cpu, mem, _lastTempC, _lastCpuClockMhz);
+    }
+
+    /// <summary>Max reported core/bus clock in MHz (LibreHardwareMonitor), refreshed on hardware poll interval.</summary>
+    private double? TryGetCpuMaxClockMhz()
+    {
+        try
+        {
+            double? max = null;
+            foreach (var hw in _computer.Hardware)
+            {
+                if (hw.HardwareType != HardwareType.Cpu) continue;
+                TryUpdate(hw);
+                foreach (var s in hw.Sensors)
+                {
+                    if (s.SensorType != SensorType.Clock) continue;
+                    var v = s.Value;
+                    if (v is null) continue;
+                    var mhz = (double)v.Value;
+                    if (!double.IsFinite(mhz) || mhz < 200) continue;
+                    max = max is null ? mhz : Math.Max(max.Value, mhz);
+                }
+            }
+
+            return max;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static double GetMemPercent()
