@@ -22,6 +22,7 @@
     <MediaTemplate EmbedCab="yes" />
 
     <ui:WixUI Id="WixUI_InstallDir" />
+    <WixVariable Id="WixUILicenseRtf" Value="C:\dev\Cursor\Data Gone\TaskbarResourceMonitor\installer\license-gplv3.rtf" />
 
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
 

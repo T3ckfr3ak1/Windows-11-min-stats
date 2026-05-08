@@ -1,0 +1,11 @@
+**/bin/
+**/obj/
+*.user
+
+# Installer build artifacts
+installer/publish/
+installer/out/*.wixpdb
+
+# Keep latest MSI in git (explicitly NOT ignored)
+!installer/out/TaskbarResourceMonitor.msi
+
