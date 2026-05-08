@@ -41,12 +41,19 @@ if (Test-Path $appIcon) {
   Copy-Item -Path $appIcon -Destination (Join-Path $publishDir "app.ico") -Force
 }
 
+$licenseRtf = Join-Path $PSScriptRoot "license-gplv3.rtf"
+$publishedExe = Join-Path $publishDir "TaskbarResourceMonitor.exe"
+$publishedIco = Join-Path $publishDir "app.ico"
+
 Write-Host "Building MSI..." -ForegroundColor Cyan
+# Use preprocessor paths (not bindpath): WiX leaves `!(bindpath.*)` in File table literals otherwise.
 wix build $wxs `
   -arch x64 `
   -ext WixToolset.UI.wixext `
   -ext WixToolset.Util.wixext `
-  -bindpath "publish=$publishDir" `
+  -d "PublishedExe=$publishedExe" `
+  -d "PublishedIco=$publishedIco" `
+  -d "LicenseRtf=$licenseRtf" `
   -o (Join-Path $outDir "TaskbarResourceMonitor.msi") | Out-Host
 
 Write-Host "MSI created:" (Join-Path $outDir "TaskbarResourceMonitor.msi") -ForegroundColor Green

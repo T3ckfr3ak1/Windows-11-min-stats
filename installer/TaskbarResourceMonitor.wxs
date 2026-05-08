@@ -4,15 +4,14 @@
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
 
   <!--
-    NOTE:
-    - Files are taken from installer\publish via -bindpath.
-    - UpgradeCode should remain stable across releases.
+    PublishedExe/PublishedIco/LicenseRtf are set by build-installer.ps1 (-define).
+    UpgradeCode must stay stable across releases.
   -->
 
   <Package
     Name="Taskbar Resource Monitor"
     Manufacturer="TaskbarResourceMonitor"
-    Version="1.0.0"
+    Version="1.0.2"
     UpgradeCode="{2F6A0E1C-0A5D-4E5B-9F8C-4D6A0E83C9D2}"
     Compressed="yes"
     Scope="perMachine">
@@ -22,26 +21,26 @@
     <MediaTemplate EmbedCab="yes" />
 
     <ui:WixUI Id="WixUI_InstallDir" />
-    <WixVariable Id="WixUILicenseRtf" Value="C:\dev\Cursor\Data Gone\TaskbarResourceMonitor\installer\license-gplv3.rtf" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(LicenseRtf)" />
 
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
 
-    <Icon Id="AppIcon" SourceFile="!(bindpath.publish)app.ico" />
+    <Icon Id="AppIcon" SourceFile="$(PublishedIco)" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
 
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="TaskbarResourceMonitor">
         <Component Id="MainExe" Guid="{A8E8D4F1-6A36-4D61-8A2E-8D3D4BC7A4E1}">
-          <File Id="TaskbarExe" Source="!(bindpath.publish)TaskbarResourceMonitor.exe" KeyPath="yes" />
+          <File Id="TaskbarExe" Source="$(PublishedExe)" KeyPath="yes" />
 
           <!-- Start Menu shortcut -->
           <Shortcut Id="StartMenuShortcut"
-                    Directory="ProgramMenuFolder"
+                    Directory="TaskbarRmStartMenuFolder"
                     Name="Taskbar Resource Monitor"
                     WorkingDirectory="INSTALLFOLDER"
                     Target="[INSTALLFOLDER]TaskbarResourceMonitor.exe" />
 
-          <RemoveFolder Id="RemoveProgramMenuFolder" Directory="ProgramMenuFolder" On="uninstall" />
+          <RemoveFolder Id="RemoveTaskbarRmStartMenuFolder" Directory="TaskbarRmStartMenuFolder" On="uninstall" />
 
           <RegistryValue Root="HKLM"
                          Key="Software\TaskbarResourceMonitor"
@@ -54,7 +53,8 @@
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="ProgramMenuFolder" Name="TaskbarResourceMonitor" />
+      <!-- Nested folder cannot reuse Id ProgramMenuFolder -->
+      <Directory Id="TaskbarRmStartMenuFolder" Name="TaskbarResourceMonitor" />
     </StandardDirectory>
 
     <Feature Id="MainFeature" Title="Taskbar Resource Monitor" Level="1">

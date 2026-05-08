@@ -4,9 +4,17 @@ namespace TaskbarResourceMonitor;
 
 public sealed class TaskbarWidgetForm : Form
 {
+    /// <summary>Width for CPU+RAM + one rotating disk graph (client area).</summary>
+    private const int BaseClientWidth = 326;
+
+    private const int ClientWidthExtraPerAdditionalDrive = 44;
+
+    private const int WidgetHeight = 52;
+
     private readonly Metrics _metrics = new();
     private readonly RingBuffer _cpu = new(60);
     private readonly RingBuffer _mem = new(60);
+    private readonly RingBuffer _diskSamples = new(60);
     private readonly SettingsStore _settings = new();
     private string[] _drives = ["C:\\"];
     private int _driveIdx;
@@ -38,8 +46,7 @@ public sealed class TaskbarWidgetForm : Form
         BackColor = Color.FromArgb(18, 18, 18);
         ForeColor = Color.Gainsboro;
 
-        Width = 220;
-        Height = 46;
+        ClientSize = new Size(PreferredClientWidthForDriveCount(_drives.Length), WidgetHeight);
 
         _timer = new System.Windows.Forms.Timer { Interval = 1000 };
         _timer.Tick += (_, _) => SampleAndRedraw();
@@ -77,6 +84,20 @@ public sealed class TaskbarWidgetForm : Form
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exit);
         ContextMenuStrip = menu;
+    }
+
+    private static int PreferredClientWidthForDriveCount(int selectedDriveCount)
+    {
+        var n = Math.Max(1, selectedDriveCount);
+        return BaseClientWidth + (n - 1) * ClientWidthExtraPerAdditionalDrive;
+    }
+
+    /// <summary>CPU/RAM/graphs stay readable; widen when more drives are monitored (rotation).</summary>
+    private void ApplyPreferredWidthFromDriveSelection()
+    {
+        var w = PreferredClientWidthForDriveCount(_drives.Length);
+        if (ClientSize.Width != w || ClientSize.Height != WidgetHeight)
+            ClientSize = new Size(w, WidgetHeight);
     }
 
     private void PositionNearTaskbar()
@@ -126,6 +147,7 @@ public sealed class TaskbarWidgetForm : Form
         var root = _drives.Length > 0 ? _drives[_driveIdx % _drives.Length] : "C:\\";
         var usage = Storage.TryGetUsage(root);
         _disk = usage is { } u ? (root, u.usedPercent) : null;
+        _diskSamples.Add(_disk is { } d ? d.usedPercent : 0);
 
         Invalidate();
     }
@@ -135,6 +157,8 @@ public sealed class TaskbarWidgetForm : Form
         _drives = (drives is { Length: > 0 }) ? drives : ["C:\\"];
         _driveIdx = 0;
         _diskTick = 0;
+        ApplyPreferredWidthFromDriveSelection();
+        Invalidate();
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -149,24 +173,23 @@ public sealed class TaskbarWidgetForm : Form
         using var bg = new SolidBrush(BackColor);
         g.FillRectangle(bg, ClientRectangle);
 
-        var pad = 6;
-        var inner = Rectangle.Inflate(ClientRectangle, -pad, -6);
-        inner.Height = Math.Max(18, inner.Height);
-
-        // Layout row 1: CPU graph left, MEM graph middle, TEMP text right (only if available)
-        var row1 = new Rectangle(inner.Left, inner.Top, inner.Width, 22);
-        var row2 = new Rectangle(inner.Left, inner.Top + 24, inner.Width, inner.Height - 24);
+        var pad = 8;
+        var inner = Rectangle.Inflate(ClientRectangle, -pad, -pad);
 
         var tempW = _showTemp ? 44 : 0;
         var gap = 8;
-        var graphW = Math.Max(40, (row1.Width - tempW - gap) / 2);
+        var graphW = Math.Max(
+            54,
+            (inner.Width - tempW - (tempW > 0 ? gap : 0) - gap * 2) / 3);
 
-        var cpuRect = new Rectangle(row1.Left, row1.Top, graphW, row1.Height);
-        var memRect = new Rectangle(cpuRect.Right + gap, row1.Top, graphW, row1.Height);
-        var tempRect = new Rectangle(memRect.Right + gap, row1.Top, tempW, row1.Height);
+        var cpuRect = new Rectangle(inner.Left, inner.Top, graphW, inner.Height);
+        var memRect = new Rectangle(cpuRect.Right + gap, inner.Top, graphW, inner.Height);
+        var diskRect = new Rectangle(memRect.Right + gap, inner.Top, graphW, inner.Height);
+        var tempRect = new Rectangle(diskRect.Right + (tempW > 0 ? gap : 0), inner.Top, tempW, inner.Height);
 
         DrawGraph(g, cpuRect, _cpu.Snapshot(), Color.FromArgb(255, 90, 220, 90), "CPU");
         DrawGraph(g, memRect, _mem.Snapshot(), Color.FromArgb(255, 110, 160, 255), "RAM");
+        DrawDiskGraph(g, diskRect, _diskSamples.Snapshot(), _disk);
 
         if (_showTemp && _tempC is { } t)
         {
@@ -179,41 +202,43 @@ public sealed class TaskbarWidgetForm : Form
             g.DrawString(s, f, br, x, y);
         }
 
-        DrawDiskBar(g, row2, _disk);
-
         using var border = new Pen(Color.FromArgb(90, 255, 255, 255));
         g.DrawRectangle(border, 0, 0, ClientRectangle.Width - 1, ClientRectangle.Height - 1);
     }
 
-    private void DrawDiskBar(Graphics g, Rectangle rect, (string root, double usedPercent)? disk)
+    /// <summary>Third mini graph matching CPU/RAM; label shows rotating drive letter.</summary>
+    private void DrawDiskGraph(
+        Graphics g,
+        Rectangle rect,
+        double[] series,
+        (string root, double usedPercent)? disk)
     {
-        using var border = new Pen(Color.FromArgb(90, 255, 255, 255));
-        using var labelBrush = new SolidBrush(Color.FromArgb(190, 230, 230, 230));
-        using var fillBrush = new SolidBrush(Color.FromArgb(255, 180, 140, 255)); // purple-ish
-        using var bgBrush = new SolidBrush(Color.FromArgb(90, 255, 255, 255));
-        using var f = new Font("Segoe UI", 7, FontStyle.Regular);
-
-        g.DrawRectangle(border, rect);
-        var plot = Rectangle.Inflate(rect, -3, -3);
+        var color = Color.FromArgb(255, 185, 130, 255);
+        string label = disk is { } d
+            ? $"DSK {d.root.TrimEnd('\\')}" // e.g. DSK C: or DSK D:
+            : "DSK";
 
         if (disk is null)
         {
-            g.DrawString("DISK n/a", f, labelBrush, plot.Left, plot.Top - 1);
+            DrawGraphUnavailable(g, rect, label);
             return;
         }
 
-        var (root, used) = disk.Value;
-        used = Math.Clamp(used, 0, 100);
-        var label = $"DISK {root.TrimEnd('\\')}: {used:0}%";
-        g.DrawString(label, f, labelBrush, plot.Left, plot.Top - 1);
+        DrawGraph(g, rect, series, color, label);
+    }
 
-        var bar = new Rectangle(plot.Left, plot.Top + 10, plot.Width, Math.Max(6, plot.Height - 10));
-        g.FillRectangle(bgBrush, bar);
-        var w = (int)Math.Round(bar.Width * (used / 100.0));
-        if (w > 0)
-        {
-            g.FillRectangle(fillBrush, new Rectangle(bar.Left, bar.Top, w, bar.Height));
-        }
+    private void DrawGraphUnavailable(Graphics g, Rectangle rect, string label)
+    {
+        using var border = new Pen(Color.FromArgb(90, 255, 255, 255));
+        using var labelBrush = new SolidBrush(Color.FromArgb(170, 230, 230, 230));
+        using var muted = new SolidBrush(Color.FromArgb(120, 200, 200, 200));
+        g.DrawRectangle(border, rect);
+        var plot = Rectangle.Inflate(rect, -3, -3);
+        using var f = new Font("Segoe UI", 7, FontStyle.Regular);
+        g.DrawString(label, f, labelBrush, plot.Left - 1, plot.Top - 2);
+        var na = "n/a";
+        var sz = g.MeasureString(na, f);
+        g.DrawString(na, f, muted, plot.Right - sz.Width, plot.Bottom - sz.Height);
     }
 
     private void DrawGraph(Graphics g, Rectangle rect, double[] series, Color color, string label)
