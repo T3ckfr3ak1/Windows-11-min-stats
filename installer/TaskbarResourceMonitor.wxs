@@ -12,12 +12,28 @@
   <Package
     Name="Taskbar Resource Monitor"
     Manufacturer="TaskbarResourceMonitor"
-    Version="1.0.3"
+    Version="1.0.4"
     UpgradeCode="{2F6A0E1C-0A5D-4E5B-9F8C-4D6A0E83C9D2}"
     Compressed="yes"
     Scope="perUser">
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Taskbar Resource Monitor is already installed." />
+    <!-- afterInstallValidate: uninstall related products (same UpgradeCode) before upgrading files. -->
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of Taskbar Resource Monitor is already installed."
+      Schedule="afterInstallValidate"
+      IgnoreLanguage="yes"
+      MigrateFeatures="yes" />
+
+    <!-- Prefer graceful exit; forcibly terminate if still running before file ops. -->
+    <util:CloseApplication
+      Id="CloseRunningTaskbarRm"
+      Target="TaskbarResourceMonitor.exe"
+      Description="Taskbar Resource Monitor will close while setup updates files."
+      CloseMessage="yes"
+      Timeout="10"
+      RebootPrompt="no"
+      PromptToContinue="no"
+      TerminateProcess="194" />
 
     <MediaTemplate EmbedCab="yes" />
 
