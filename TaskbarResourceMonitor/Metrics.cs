@@ -9,15 +9,20 @@ internal sealed class Metrics : IDisposable
 {
     private readonly PerformanceCounter _cpuCounter;
     private readonly Computer _computer;
-
+    private readonly List<PerformanceCounter> _frequencyCounters = [];
     private DateTime _nextHardwarePoll = DateTime.MinValue;
+    private DateTime _nextWmiCpuClockPoll = DateTime.MinValue;
     private double? _lastTempC;
-    private double? _lastCpuClockMhz;
+    /// <summary>LibreHardwareMonitor clock sensors; refreshed every hardware poll (~4s).</summary>
+    private double? _lhmCpuClockMhz;
+    private double? _cachedWmiCpuMhz;
 
     public Metrics()
     {
         _cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
         _ = _cpuCounter.NextValue(); // prime
+
+        TryAttachProcessorFrequencyCounters();
 
         _computer = new Computer
         {
@@ -38,14 +43,116 @@ internal sealed class Metrics : IDisposable
         {
             _nextHardwarePoll = DateTime.UtcNow.AddSeconds(4);
             _lastTempC = TryGetTempC() ?? TryGetAcpiTempC();
-            _lastCpuClockMhz = TryGetCpuMaxClockMhz();
+            _lhmCpuClockMhz = TryGetCpuMaxClockMhzLhm();
         }
 
-        return (cpu, mem, _lastTempC, _lastCpuClockMhz);
+        var mhz = CombineCpuMegahertzPreferred();
+
+        return (cpu, mem, _lastTempC, mhz);
     }
 
-    /// <summary>Max reported core/bus clock in MHz (LibreHardwareMonitor), refreshed on hardware poll interval.</summary>
-    private double? TryGetCpuMaxClockMhz()
+    /// <summary>Prefer LHM (hardware poll), then live perf counters, then WMI nominal speed (slow path / cached).</summary>
+    private double? CombineCpuMegahertzPreferred()
+    {
+        if (_lhmCpuClockMhz is { } lh && lh >= 300 && lh <= 9200 && double.IsFinite(lh))
+            return lh;
+
+        var pc = TryReadProcessorFrequencyCounterMhz();
+        if (pc is { } f && double.IsFinite(f) && f >= 350 && f <= 9200)
+            return f;
+
+        var wmi = TryGetCpuMhzWmiCached();
+        if (wmi is not null)
+            return wmi;
+
+        if (_lhmCpuClockMhz is { } lh2 && double.IsFinite(lh2))
+            return lh2;
+
+        return pc;
+    }
+
+    private void TryAttachProcessorFrequencyCounters()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        TryAddFreq("Processor Information", "Processor Frequency", "0,_Total");
+        TryAddFreq("Processor Information", "Processor Frequency", "_Total");
+
+        try
+        {
+            if (!PerformanceCounterCategory.Exists("Processor Information")) return;
+            var cat = new PerformanceCounterCategory("Processor Information");
+            foreach (var name in cat.GetInstanceNames())
+            {
+                if (!name.AsSpan().EndsWith("_Total", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                TryAddFreq("Processor Information", "Processor Frequency", name);
+            }
+        }
+        catch { /* ignore */ }
+    }
+
+    private void TryAddFreq(string categoryName, string counterName, string instanceName)
+    {
+        try
+        {
+            var c = new PerformanceCounter(categoryName, counterName, instanceName, readOnly: true);
+            _ = c.NextValue();
+            _frequencyCounters.Add(c);
+        }
+        catch { /* instance may not exist on this SKU */ }
+    }
+
+    private double? TryReadProcessorFrequencyCounterMhz()
+    {
+        foreach (var c in _frequencyCounters)
+        {
+            try
+            {
+                var v = (double)c.NextValue();
+                if (double.IsFinite(v) && v > 150 && v < 15000)
+                    return v;
+            }
+            catch { /* disposed / access */ }
+        }
+        return null;
+    }
+
+    private double? TryGetCpuMhzWmiCached()
+    {
+        var now = DateTime.UtcNow;
+        if (now < _nextWmiCpuClockPoll)
+            return _cachedWmiCpuMhz;
+
+        _cachedWmiCpuMhz = TryGetCpuMhzWmi();
+        _nextWmiCpuClockPoll = now.AddSeconds(5);
+        return _cachedWmiCpuMhz;
+    }
+
+    /// <summary>Win32 Processor CurrentClockSpeed / MaxClockSpeed (MHz nominally).</summary>
+    private static double? TryGetCpuMhzWmi()
+    {
+        try
+        {
+            double best = 0;
+            using var searcher = new ManagementObjectSearcher(@"SELECT CurrentClockSpeed, MaxClockSpeed FROM Win32_Processor");
+            foreach (ManagementObject o in searcher.Get())
+            {
+                var curRaw = Convert.ToUInt32(o["CurrentClockSpeed"], CultureInfo.InvariantCulture);
+                var maxRaw = Convert.ToUInt32(o["MaxClockSpeed"], CultureInfo.InvariantCulture);
+                var sel = Math.Max(curRaw, maxRaw);
+                if (sel > best) best = sel;
+            }
+
+            return best > 150 ? best : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Max reported sensible CPU-ish clock MHz (LibreHardwareMonitor).</summary>
+    private double? TryGetCpuMaxClockMhzLhm()
     {
         try
         {
@@ -60,12 +167,18 @@ internal sealed class Metrics : IDisposable
                     var v = s.Value;
                     if (v is null) continue;
                     var mhz = (double)v.Value;
-                    if (!double.IsFinite(mhz) || mhz < 200) continue;
+                    if (!double.IsFinite(mhz) || mhz < 100 || mhz > 9000)
+                        continue;
+                    var nm = (s.Name ?? "").ToUpperInvariant();
+                    // Prefer CPU domain over DRAM / memory clocks when possible.
+                    if (nm.Contains("DRAM", StringComparison.Ordinal) ||
+                        nm.Contains("MEMORY", StringComparison.Ordinal))
+                        continue;
                     max = max is null ? mhz : Math.Max(max.Value, mhz);
                 }
             }
 
-            return max;
+            return max is > 0 ? max : null;
         }
         catch
         {
@@ -165,6 +278,8 @@ internal sealed class Metrics : IDisposable
     public void Dispose()
     {
         _cpuCounter.Dispose();
+        foreach (var f in _frequencyCounters)
+            try { f.Dispose(); } catch { /* ignore */ }
         try { _computer.Close(); } catch { }
     }
 }

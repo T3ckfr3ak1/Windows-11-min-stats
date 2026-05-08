@@ -227,11 +227,19 @@ public sealed class TaskbarWidgetForm : Form
 
     private static string? FormatCpuSpeed(double? mhz)
     {
-        if (mhz is not { } m || !double.IsFinite(m) || m < 200)
+        if (mhz is not { } m || !double.IsFinite(m) || m < 150)
             return null;
         if (m >= 1000)
             return $"{m / 1000.0:0.00} GHz";
         return $"{m:0} MHz";
+    }
+
+    /// <summary>Small shadow so overlays stay readable across the waveform.</summary>
+    private static void DrawShadowString(Graphics g, string text, Font font, Brush fill, float x, float y)
+    {
+        using var sh = new SolidBrush(Color.FromArgb(200, 0, 0, 0));
+        g.DrawString(text, font, sh, x + 1, y + 1);
+        g.DrawString(text, font, fill, x, y);
     }
 
     /// <summary>Third mini graph matching CPU/RAM; label shows rotating drive letter.</summary>
@@ -264,10 +272,10 @@ public sealed class TaskbarWidgetForm : Form
         try
         {
             g.SetClip(cell);
-            g.DrawString(label, f, labelBr, cell.Left + 2, cell.Top + 2);
             var na = "n/a";
-            var sz = g.MeasureString(na, f);
-            g.DrawString(na, f, muted, cell.Right - sz.Width - 2, cell.Bottom - sz.Height - 2);
+            var szNa = g.MeasureString(na, f);
+            DrawShadowString(g, label, f, labelBr, cell.Left + 2, cell.Top + 2);
+            DrawShadowString(g, na, f, muted, cell.Right - szNa.Width - 2, cell.Bottom - szNa.Height - 2);
         }
         finally
         {
@@ -287,46 +295,37 @@ public sealed class TaskbarWidgetForm : Form
         {
             g.SetClip(cell);
 
-            float y = cell.Top + 2;
-            g.DrawString(label, f, labelBr, cell.Left + 2, y);
-            y += f.Height - 1;
-            if (subtitle != null)
+            // Waveform uses the full column; text is overlaid after so the graph fills the box.
+            var plot = new Rectangle(cell.Left + 1, cell.Top + 1, Math.Max(1, cell.Width - 2), Math.Max(1, cell.Height - 2));
+            var n = Math.Min(series.Length, Math.Max(2, plot.Width));
+            if (n >= 2)
             {
-                g.DrawString(subtitle, fSub, labelBr, cell.Left + 2, y);
-                y += fSub.Height;
+                var tail = series[^n..];
+                var pts = new PointF[n];
+
+                float YFor(double pct)
+                {
+                    var t = Math.Clamp(pct / 100.0, 0.0, 1.0);
+                    return plot.Bottom - (float)(t * plot.Height);
+                }
+
+                for (var i = 0; i < n; i++)
+                {
+                    var x = plot.Left + (plot.Width - 1) * (float)i / (n - 1);
+                    pts[i] = new PointF(x, YFor(tail[i]));
+                }
+
+                g.DrawLines(linePen, pts);
+
+                var latest = tail[^1];
+                var txt = $"{latest:0}%";
+                var szPct = g.MeasureString(txt, f);
+                DrawShadowString(g, txt, f, labelBr, cell.Right - szPct.Width - 2, cell.Bottom - szPct.Height - 2);
             }
 
-            y += 1;
-            var plotBottom = cell.Bottom - 3 - f.Height;
-            if (plotBottom <= y + 4)
-                return;
-
-            var plot = Rectangle.FromLTRB(cell.Left + 1, (int)y, cell.Right - 1, plotBottom);
-
-            var n = Math.Min(series.Length, Math.Max(1, plot.Width));
-            if (n <= 1) return;
-
-            var tail = series[^n..];
-            var pts = new PointF[n];
-
-            float YFor(double pct)
-            {
-                var t = Math.Clamp(pct / 100.0, 0.0, 1.0);
-                return plot.Bottom - (float)(t * plot.Height);
-            }
-
-            for (int i = 0; i < n; i++)
-            {
-                var x = plot.Right - (n - 1 - i);
-                pts[i] = new PointF(x, YFor(tail[i]));
-            }
-
-            g.DrawLines(linePen, pts);
-
-            var latest = tail[^1];
-            var txt = $"{latest:0}%";
-            var sz = g.MeasureString(txt, f);
-            g.DrawString(txt, f, labelBr, plot.Right - sz.Width, plot.Bottom);
+            DrawShadowString(g, label, f, labelBr, cell.Left + 2, cell.Top + 2);
+            if (subtitle is not null)
+                DrawShadowString(g, subtitle, fSub, labelBr, cell.Left + 2, cell.Top + 2 + f.Height - 1);
         }
         finally
         {

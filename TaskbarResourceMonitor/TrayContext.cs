@@ -24,7 +24,7 @@ internal sealed class TrayContext : ApplicationContext
         {
             _settings.AlwaysOnTop = _alwaysOnTop.Checked;
             _settings.Save();
-            if (_widget is not null)
+            if (_widget is not null && !_widget.IsDisposed)
             {
                 _widget.TopMost = _alwaysOnTop.Checked;
             }
@@ -49,8 +49,32 @@ internal sealed class TrayContext : ApplicationContext
 
         _tray.DoubleClick += (_, _) => ToggleWidget();
 
-        // Start hidden; user wants tray-first behavior.
         BuildStorageMenu();
+        var f = EnsureWidgetCreated();
+        f.Show();
+
+        UpdateMenuState();
+    }
+
+    private TaskbarWidgetForm EnsureWidgetCreated()
+    {
+        if (_widget is not null && !_widget.IsDisposed)
+            return _widget;
+
+        _widget = new TaskbarWidgetForm
+        {
+            ShowInTaskbar = false,
+            TopMost = _settings.AlwaysOnTop,
+        };
+        _widget.SetDrives(_settings.Drives);
+        _widget.FormClosed += OnWidgetClosed;
+        return _widget;
+    }
+
+    private void OnWidgetClosed(object? sender, EventArgs e)
+    {
+        if (ReferenceEquals(_widget, sender))
+            _widget = null;
         UpdateMenuState();
     }
 
@@ -100,25 +124,13 @@ internal sealed class TrayContext : ApplicationContext
 
     private void ToggleWidget()
     {
-        if (_widget is null || _widget.IsDisposed)
-        {
-            _widget = new TaskbarWidgetForm
-            {
-                ShowInTaskbar = false,
-                TopMost = _settings.AlwaysOnTop
-            };
-            _widget.SetDrives(_settings.Drives);
-            _widget.FormClosed += (_, _) => UpdateMenuState();
-            _widget.Show();
-        }
-        else if (_widget.Visible)
-        {
-            _widget.Hide();
-        }
+        var f = EnsureWidgetCreated();
+        if (f.Visible)
+            f.Hide();
         else
         {
-            _widget.Show();
-            _widget.Activate();
+            f.Show();
+            f.Activate();
         }
 
         UpdateMenuState();
@@ -134,7 +146,8 @@ internal sealed class TrayContext : ApplicationContext
     {
         try
         {
-            if (_widget is not null && !_widget.IsDisposed) _widget.Close();
+            if (_widget is not null && !_widget.IsDisposed)
+                _widget.Close();
         }
         catch { /* ignore */ }
 
@@ -144,4 +157,3 @@ internal sealed class TrayContext : ApplicationContext
         ExitThread();
     }
 }
-
