@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <!--
+    NOTE:
+    - Files are taken from installer\publish via -bindpath.
+    - UpgradeCode should remain stable across releases.
+  -->
+
+  <Package
+    Name="Taskbar Resource Monitor"
+    Manufacturer="TaskbarResourceMonitor"
+    Version="1.0.0"
+    UpgradeCode="{2F6A0E1C-0A5D-4E5B-9F8C-4D6A0E83C9D2}"
+    Compressed="yes"
+    Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Taskbar Resource Monitor is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <ui:WixUI Id="WixUI_InstallDir" />
+
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+    <Icon Id="AppIcon" SourceFile="!(bindpath.publish)app.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="TaskbarResourceMonitor">
+        <Component Id="MainExe" Guid="{A8E8D4F1-6A36-4D61-8A2E-8D3D4BC7A4E1}">
+          <File Id="TaskbarExe" Source="!(bindpath.publish)TaskbarResourceMonitor.exe" KeyPath="yes" />
+
+          <!-- Start Menu shortcut -->
+          <Shortcut Id="StartMenuShortcut"
+                    Directory="ProgramMenuFolder"
+                    Name="Taskbar Resource Monitor"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Target="[INSTALLFOLDER]TaskbarResourceMonitor.exe" />
+
+          <RemoveFolder Id="RemoveProgramMenuFolder" Directory="ProgramMenuFolder" On="uninstall" />
+
+          <RegistryValue Root="HKLM"
+                         Key="Software\TaskbarResourceMonitor"
+                         Name="Installed"
+                         Type="integer"
+                         Value="1"
+                         KeyPath="no" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ProgramMenuFolder" Name="TaskbarResourceMonitor" />
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Taskbar Resource Monitor" Level="1">
+      <ComponentRef Id="MainExe" />
+    </Feature>
+
+  </Package>
+</Wix>
+
