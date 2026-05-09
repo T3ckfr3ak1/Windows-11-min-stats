@@ -11,12 +11,14 @@ internal sealed class Metrics : IDisposable
     private readonly PerformanceCounter _cpuCounter;
     private readonly Computer _computer;
     private readonly List<PerformanceCounter> _frequencyCounters = [];
+    private readonly List<PerformanceCounter> _pctPerfCounters = [];
     private DateTime _nextHardwarePoll = DateTime.MinValue;
-    private DateTime _nextWmiCpuClockPoll = DateTime.MinValue;
+    private DateTime _nextWmiMaxMhzPoll = DateTime.MinValue;
     private double? _lastTempC;
-    /// <summary>LibreHardwareMonitor clock sensors; refreshed every hardware poll (~4s).</summary>
+    /// <summary>LibreHardwareMonitor clock sensors; refreshed each tick when possible.</summary>
     private double? _lhmCpuClockMhz;
-    private double? _cachedWmiCpuMhz;
+    /// <summary>Win32_Processor MaxClockSpeed (MHz), not CurrentClockSpeed — Current is often stuck at base freq.</summary>
+    private double? _wmiMaxMhz;
     private DateTime _lastNetSampleUtc = DateTime.MinValue;
     private long _lastRxBytes;
     private long _lastTxBytes;
@@ -28,6 +30,7 @@ internal sealed class Metrics : IDisposable
         _ = _cpuCounter.NextValue(); // prime
 
         TryAttachProcessorFrequencyCounters();
+        TryAttachProcessorPerformanceCounters();
 
         _computer = new Computer
         {
@@ -48,8 +51,10 @@ internal sealed class Metrics : IDisposable
         {
             _nextHardwarePoll = DateTime.UtcNow.AddSeconds(4);
             _lastTempC = TryGetTempC() ?? TryGetAcpiTempC();
-            _lhmCpuClockMhz = TryGetCpuMaxClockMhzLhm();
         }
+
+        // Clock: poll every tick so turbo changes show up (LHM + perf counters).
+        _lhmCpuClockMhz = TryGetCpuMaxClockMhzLhm();
 
         var mhz = CombineCpuMegahertzPreferred();
         var (downBps, upBps) = SampleNetworkBytesPerSecond();
@@ -57,30 +62,34 @@ internal sealed class Metrics : IDisposable
         return (cpu, mem, _lastTempC, mhz, downBps, upBps);
     }
 
-    /// <summary>Prefer LHM (hardware poll), then live perf counters, then WMI nominal speed (slow path / cached).</summary>
+    /// <summary>
+    /// Prefer live sources. Avoid Win32 Processor CurrentClockSpeed — on many laptops it stays at ~base MHz (e.g. 1.9 GHz).
+    /// </summary>
     private double? CombineCpuMegahertzPreferred()
     {
-        if (_lhmCpuClockMhz is { } lh && lh >= 300 && lh <= 9200 && double.IsFinite(lh))
-            return lh;
-
-        var pc = TryReadProcessorFrequencyCounterMhz();
-        if (pc is { } f && double.IsFinite(f) && f >= 350 && f <= 9200)
+        // 1) Processor Information / Processor Frequency (MHz) when present.
+        var freq = TryReadProcessorFrequencyCounterMhz();
+        if (freq is { } f && double.IsFinite(f) && f >= 400 && f <= 9500)
             return f;
 
-        var wmi = TryGetCpuMhzWmiCached();
-        if (wmi is not null)
-            return wmi;
+        // 2) % Processor Performance × WMI MaxClockSpeed (tracks turbo vs idle).
+        var est = TryReadMhzFromProcessorPerformancePercent();
+        if (est is { } e && double.IsFinite(e) && e >= 400 && e <= 9500)
+            return e;
 
-        if (_lhmCpuClockMhz is { } lh2 && double.IsFinite(lh2))
-            return lh2;
+        // 3) LibreHardwareMonitor CPU clock sensors.
+        if (_lhmCpuClockMhz is { } lh && lh >= 400 && lh <= 9500 && double.IsFinite(lh))
+            return lh;
 
-        return pc;
+        // 4) Last resort: WMI max turbo cap only (never Win32 CurrentClockSpeed — often stuck at base).
+        return TryGetWmiMaxClockMhzCached();
     }
 
     private void TryAttachProcessorFrequencyCounters()
     {
         if (!OperatingSystem.IsWindows()) return;
         TryAddFreq("Processor Information", "Processor Frequency", "0,_Total");
+        TryAddFreq("Processor Information", "Processor Frequency", "0,0");
         TryAddFreq("Processor Information", "Processor Frequency", "_Total");
 
         try
@@ -88,11 +97,35 @@ internal sealed class Metrics : IDisposable
             if (!PerformanceCounterCategory.Exists("Processor Information")) return;
             var cat = new PerformanceCounterCategory("Processor Information");
             foreach (var name in cat.GetInstanceNames())
-            {
-                if (!name.AsSpan().EndsWith("_Total", StringComparison.OrdinalIgnoreCase))
-                    continue;
                 TryAddFreq("Processor Information", "Processor Frequency", name);
-            }
+        }
+        catch { /* ignore */ }
+    }
+
+    private void TryAttachProcessorPerformanceCounters()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        TryAddPct("Processor Information", "% Processor Performance", "0,_Total");
+        TryAddPct("Processor Information", "% Processor Performance", "0,0");
+        TryAddPct("Processor Information", "% Processor Performance", "_Total");
+
+        try
+        {
+            if (!PerformanceCounterCategory.Exists("Processor Information")) return;
+            var cat = new PerformanceCounterCategory("Processor Information");
+            foreach (var name in cat.GetInstanceNames())
+                TryAddPct("Processor Information", "% Processor Performance", name);
+        }
+        catch { /* ignore */ }
+    }
+
+    private void TryAddPct(string categoryName, string counterName, string instanceName)
+    {
+        try
+        {
+            var c = new PerformanceCounter(categoryName, counterName, instanceName, readOnly: true);
+            _ = c.NextValue();
+            _pctPerfCounters.Add(c);
         }
         catch { /* ignore */ }
     }
@@ -115,7 +148,8 @@ internal sealed class Metrics : IDisposable
             try
             {
                 var v = (double)c.NextValue();
-                if (double.IsFinite(v) && v > 150 && v < 15000)
+                // Ignore bogus stuck-at-base readings some stacks surface as ~1900 when idle APIs lie.
+                if (double.IsFinite(v) && v >= 400 && v <= 9500)
                     return v;
             }
             catch { /* disposed / access */ }
@@ -123,30 +157,54 @@ internal sealed class Metrics : IDisposable
         return null;
     }
 
-    private double? TryGetCpuMhzWmiCached()
+    private double? TryReadMhzFromProcessorPerformancePercent()
     {
-        var now = DateTime.UtcNow;
-        if (now < _nextWmiCpuClockPoll)
-            return _cachedWmiCpuMhz;
+        var max = TryGetWmiMaxClockMhzCached();
+        if (max is null || max < 400)
+            return null;
 
-        _cachedWmiCpuMhz = TryGetCpuMhzWmi();
-        _nextWmiCpuClockPoll = now.AddSeconds(5);
-        return _cachedWmiCpuMhz;
+        double bestPct = -1;
+        foreach (var c in _pctPerfCounters)
+        {
+            try
+            {
+                var v = (double)c.NextValue();
+                if (!double.IsFinite(v)) continue;
+                // Typically 0–100; occasionally reported >100 on some builds.
+                if (v > bestPct) bestPct = v;
+            }
+            catch { /* ignore */ }
+        }
+
+        if (bestPct < 0)
+            return null;
+
+        var pct = Math.Clamp(bestPct, 0.0, 200.0);
+        return Math.Clamp(max.Value * (pct / 100.0), 100.0, 9500.0);
     }
 
-    /// <summary>Win32 Processor CurrentClockSpeed / MaxClockSpeed (MHz nominally).</summary>
-    private static double? TryGetCpuMhzWmi()
+    private double? TryGetWmiMaxClockMhzCached()
+    {
+        var now = DateTime.UtcNow;
+        if (now < _nextWmiMaxMhzPoll && _wmiMaxMhz is not null)
+            return _wmiMaxMhz;
+
+        _wmiMaxMhz = TryGetWmiMaxClockMhz();
+        _nextWmiMaxMhzPoll = now.AddSeconds(60);
+        return _wmiMaxMhz;
+    }
+
+    /// <summary>Win32 Processor MaxClockSpeed only (MHz). Do not use CurrentClockSpeed for live frequency.</summary>
+    private static double? TryGetWmiMaxClockMhz()
     {
         try
         {
             double best = 0;
-            using var searcher = new ManagementObjectSearcher(@"SELECT CurrentClockSpeed, MaxClockSpeed FROM Win32_Processor");
+            using var searcher = new ManagementObjectSearcher(@"SELECT MaxClockSpeed FROM Win32_Processor");
             foreach (ManagementObject o in searcher.Get())
             {
-                var curRaw = Convert.ToUInt32(o["CurrentClockSpeed"], CultureInfo.InvariantCulture);
                 var maxRaw = Convert.ToUInt32(o["MaxClockSpeed"], CultureInfo.InvariantCulture);
-                var sel = Math.Max(curRaw, maxRaw);
-                if (sel > best) best = sel;
+                if (maxRaw > best) best = maxRaw;
             }
 
             return best > 150 ? best : null;
@@ -358,6 +416,8 @@ internal sealed class Metrics : IDisposable
         _cpuCounter.Dispose();
         foreach (var f in _frequencyCounters)
             try { f.Dispose(); } catch { /* ignore */ }
+        foreach (var p in _pctPerfCounters)
+            try { p.Dispose(); } catch { /* ignore */ }
         try { _computer.Close(); } catch { }
     }
 }
