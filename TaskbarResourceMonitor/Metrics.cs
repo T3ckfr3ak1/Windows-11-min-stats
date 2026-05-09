@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Management;
+using System.Net.NetworkInformation;
 using LibreHardwareMonitor.Hardware;
 
 namespace TaskbarResourceMonitor;
@@ -16,6 +17,10 @@ internal sealed class Metrics : IDisposable
     /// <summary>LibreHardwareMonitor clock sensors; refreshed every hardware poll (~4s).</summary>
     private double? _lhmCpuClockMhz;
     private double? _cachedWmiCpuMhz;
+    private DateTime _lastNetSampleUtc = DateTime.MinValue;
+    private long _lastRxBytes;
+    private long _lastTxBytes;
+    private long _lastIfSpeedBits;
 
     public Metrics()
     {
@@ -34,7 +39,7 @@ internal sealed class Metrics : IDisposable
         try { _computer.Open(); } catch { /* optional */ }
     }
 
-    public (double cpu, double mem, double? tempC, double? cpuClockMhz) Sample()
+    public (double cpu, double mem, double? tempC, double? cpuClockMhz, double netDownPct, double netUpPct) Sample()
     {
         var cpu = Safe(() => (double)_cpuCounter.NextValue(), 0);
         var mem = Safe(GetMemPercent, 0);
@@ -47,8 +52,9 @@ internal sealed class Metrics : IDisposable
         }
 
         var mhz = CombineCpuMegahertzPreferred();
+        var (downPct, upPct) = SampleNetworkUtilizationPercent();
 
-        return (cpu, mem, _lastTempC, mhz);
+        return (cpu, mem, _lastTempC, mhz, downPct, upPct);
     }
 
     /// <summary>Prefer LHM (hardware poll), then live perf counters, then WMI nominal speed (slow path / cached).</summary>
@@ -261,6 +267,80 @@ internal sealed class Metrics : IDisposable
         {
             return null;
         }
+    }
+
+    private (double downPct, double upPct) SampleNetworkUtilizationPercent()
+    {
+        try
+        {
+            var now = DateTime.UtcNow;
+            var ni = PickPrimaryNetworkInterface();
+            if (ni is null) return (0, 0);
+
+            var stats = ni.GetIPStatistics();
+            var rx = stats.BytesReceived;
+            var tx = stats.BytesSent;
+            var speedBits = ni.Speed;
+
+            if (_lastNetSampleUtc == DateTime.MinValue)
+            {
+                _lastNetSampleUtc = now;
+                _lastRxBytes = rx;
+                _lastTxBytes = tx;
+                _lastIfSpeedBits = speedBits;
+                return (0, 0);
+            }
+
+            var dt = (now - _lastNetSampleUtc).TotalSeconds;
+            if (dt <= 0.2) return (0, 0);
+
+            var dRx = Math.Max(0, rx - _lastRxBytes);
+            var dTx = Math.Max(0, tx - _lastTxBytes);
+            _lastNetSampleUtc = now;
+            _lastRxBytes = rx;
+            _lastTxBytes = tx;
+            _lastIfSpeedBits = speedBits;
+
+            if (speedBits <= 0) return (0, 0);
+
+            var downBps = dRx / dt;
+            var upBps = dTx / dt;
+            var downPct = Math.Clamp((downBps * 8.0) / speedBits * 100.0, 0.0, 100.0);
+            var upPct = Math.Clamp((upBps * 8.0) / speedBits * 100.0, 0.0, 100.0);
+            return (downPct, upPct);
+        }
+        catch
+        {
+            return (0, 0);
+        }
+    }
+
+    private static NetworkInterface? PickPrimaryNetworkInterface()
+    {
+        NetworkInterface? best = null;
+        long bestSpeed = 0;
+        foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            try
+            {
+                if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                if (ni.NetworkInterfaceType is NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel) continue;
+                if (ni.Speed <= 0) continue;
+
+                var ip = ni.GetIPProperties();
+                var hasGateway = ip.GatewayAddresses.Any(g => g?.Address is not null && !g.Address.Equals(System.Net.IPAddress.Any));
+                if (!hasGateway) continue;
+
+                // Prefer higher link speed.
+                if (ni.Speed > bestSpeed)
+                {
+                    best = ni;
+                    bestSpeed = ni.Speed;
+                }
+            }
+            catch { /* ignore interface errors */ }
+        }
+        return best;
     }
 
     private static T Safe<T>(Func<T> f, T fallback)

@@ -5,7 +5,7 @@ namespace TaskbarResourceMonitor;
 public sealed class TaskbarWidgetForm : Form
 {
     /// <summary>Width for CPU+RAM + one rotating disk graph (client area).</summary>
-    private const int BaseClientWidth = 326;
+    private const int BaseClientWidth = 404;
 
     private const int ClientWidthExtraPerAdditionalDrive = 44;
 
@@ -14,6 +14,8 @@ public sealed class TaskbarWidgetForm : Form
     private readonly Metrics _metrics = new();
     private readonly RingBuffer _cpu = new(60);
     private readonly RingBuffer _mem = new(60);
+    private readonly RingBuffer _netDown = new(60);
+    private readonly RingBuffer _netUp = new(60);
     private readonly RingBuffer _diskSamples = new(60);
     private readonly SettingsStore _settings = new();
     private string[] _drives = ["C:\\"];
@@ -70,8 +72,9 @@ public sealed class TaskbarWidgetForm : Form
         Resize += (_, _) => PositionNearTaskbar();
         LocationChanged += (_, _) => PositionNearTaskbar();
 
-        // Exit on middle click for convenience; right click menu too.
+        // Right click menu.
         var menu = new ContextMenuStrip();
+        var storageMenu = new ToolStripMenuItem("Storage drives");
         var alwaysOnTop = new ToolStripMenuItem("Always on Top")
         {
             CheckOnClick = true,
@@ -85,10 +88,56 @@ public sealed class TaskbarWidgetForm : Form
         };
         var exit = new ToolStripMenuItem("Exit");
         exit.Click += (_, _) => Close();
+        menu.Items.Add(storageMenu);
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(alwaysOnTop);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exit);
         ContextMenuStrip = menu;
+
+        BuildStorageMenu(storageMenu);
+    }
+
+    private void BuildStorageMenu(ToolStripMenuItem storageMenu)
+    {
+        storageMenu.DropDownItems.Clear();
+
+        var available = new HashSet<string>(
+            Storage.AvailableDriveRoots().Select(r => r.TrimEnd('\\') + "\\"),
+            StringComparer.OrdinalIgnoreCase);
+
+        // Default to C:\ if nothing selected
+        if (_settings.Drives.Length == 0)
+        {
+            _settings.Drives = ["C:\\"];
+            _settings.Save();
+        }
+
+        foreach (var root in available.OrderBy(s => s, StringComparer.OrdinalIgnoreCase))
+        {
+            var item = new ToolStripMenuItem(root)
+            {
+                CheckOnClick = true,
+                Checked = _settings.Drives.Any(d => string.Equals(Norm(d), root, StringComparison.OrdinalIgnoreCase))
+            };
+
+            item.CheckedChanged += (_, _) =>
+            {
+                var selected = _settings.Drives.Select(Norm).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                if (item.Checked) selected.Add(root);
+                else selected.Remove(root);
+                if (selected.Count == 0) selected.Add("C:\\");
+
+                _settings.Drives = selected.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+                _settings.Save();
+
+                SetDrives(_settings.Drives);
+            };
+
+            storageMenu.DropDownItems.Add(item);
+        }
+
+        static string Norm(string d) => (d ?? "").Trim().TrimEnd('\\') + "\\";
     }
 
     private static int PreferredClientWidthForDriveCount(int selectedDriveCount)
@@ -111,18 +160,20 @@ public sealed class TaskbarWidgetForm : Form
         var screen = Screen.PrimaryScreen?.Bounds ?? new Rectangle(0, 0, 1920, 1080);
         var work = Screen.PrimaryScreen?.WorkingArea ?? screen;
 
-        // Assume taskbar is on bottom (most common). We'll sit on top of it, aligned right.
+        // Assume taskbar is on bottom (most common). Flush to the right edge of the working area (= screen edge when the taskbar spans the bottom).
         var taskbarHeight = Math.Max(0, screen.Height - work.Height);
-        var x = work.Right - Width - 8;
+        var x = Math.Max(work.Left, work.Right - Width);
         var y = screen.Bottom - taskbarHeight - Height;
         Location = new Point(Math.Max(work.Left, x), Math.Max(work.Top, y));
     }
 
     private void SampleAndRedraw()
     {
-        var (cpu, mem, tempC, cpuMhz) = _metrics.Sample();
+        var (cpu, mem, tempC, cpuMhz, netDownPct, netUpPct) = _metrics.Sample();
         _cpu.Add(cpu);
         _mem.Add(mem);
+        _netDown.Add(netDownPct);
+        _netUp.Add(netUpPct);
         _cpuClockMhz = cpuMhz;
 
         // Probe temps continually, but only display when reliably present.
@@ -185,18 +236,21 @@ public sealed class TaskbarWidgetForm : Form
         var tempW = _showTemp ? 44 : 0;
         const int tempPad = 4;
         var stripW = inner.Width - tempW - (tempW > 0 ? tempPad : 0);
-        var w1 = stripW / 3;
-        var w2 = stripW / 3;
-        var w3 = stripW - w1 - w2;
+        var w1 = stripW / 4;
+        var w2 = stripW / 4;
+        var w3 = stripW / 4;
+        var w4 = stripW - w1 - w2 - w3;
 
         var cpuRect = new Rectangle(inner.Left, inner.Top, w1, inner.Height);
         var memRect = new Rectangle(cpuRect.Right, inner.Top, w2, inner.Height);
-        var diskRect = new Rectangle(memRect.Right, inner.Top, w3, inner.Height);
+        var netRect = new Rectangle(memRect.Right, inner.Top, w3, inner.Height);
+        var diskRect = new Rectangle(netRect.Right, inner.Top, w4, inner.Height);
         var tempRect = new Rectangle(diskRect.Right + (tempW > 0 ? tempPad : 0), inner.Top, tempW, inner.Height);
 
         var cpuSpeed = FormatCpuSpeed(_cpuClockMhz);
         DrawGraph(g, cpuRect, _cpu.Snapshot(), Color.FromArgb(255, 90, 220, 90), "CPU", cpuSpeed);
         DrawGraph(g, memRect, _mem.Snapshot(), Color.FromArgb(255, 110, 160, 255), "RAM");
+        DrawDualGraph(g, netRect, _netDown.Snapshot(), _netUp.Snapshot(), "NET", "DL", "UL");
         DrawDiskGraph(g, diskRect, _diskSamples.Snapshot(), _disk);
 
         if (_showTemp && _tempC is { } t)
@@ -210,15 +264,17 @@ public sealed class TaskbarWidgetForm : Form
             g.DrawString(s, f, br, x, y);
         }
 
+        // Dividers & outer rim last so waveform can run flush to edges under them.
         using (var rule = new Pen(BorderLine))
         {
-            // Shared vertical edges only (no inner boxes around each graph).
             if (memRect.Left > inner.Left)
-                g.DrawLine(rule, memRect.Left, inner.Top, memRect.Left, inner.Bottom);
-            if (diskRect.Left > memRect.Left)
-                g.DrawLine(rule, diskRect.Left, inner.Top, diskRect.Left, inner.Bottom);
+                g.DrawLine(rule, memRect.Left, inner.Top, memRect.Left, inner.Bottom - 1);
+            if (netRect.Left > memRect.Left)
+                g.DrawLine(rule, netRect.Left, inner.Top, netRect.Left, inner.Bottom - 1);
+            if (diskRect.Left > netRect.Left)
+                g.DrawLine(rule, diskRect.Left, inner.Top, diskRect.Left, inner.Bottom - 1);
             if (tempW > 0 && tempRect.Left > diskRect.Right)
-                g.DrawLine(rule, tempRect.Left - 1, inner.Top, tempRect.Left - 1, inner.Bottom);
+                g.DrawLine(rule, tempRect.Left - 1, inner.Top, tempRect.Left - 1, inner.Bottom - 1);
         }
 
         using var outer = new Pen(BorderLine);
@@ -293,11 +349,16 @@ public sealed class TaskbarWidgetForm : Form
         var state = g.Save();
         try
         {
+            // Clip exactly to column; polyline spans the full interior (no inset) so it meets the bordered box.
             g.SetClip(cell);
 
-            // Waveform uses the full column; text is overlaid after so the graph fills the box.
-            var plot = new Rectangle(cell.Left + 1, cell.Top + 1, Math.Max(1, cell.Width - 2), Math.Max(1, cell.Height - 2));
-            var n = Math.Min(series.Length, Math.Max(2, plot.Width));
+            float plotLeft = cell.Left;
+            float plotRight = cell.Right - 1f;
+            float plotTop = cell.Top;
+            float plotBottom = cell.Bottom - 1f;
+            float plotH = Math.Max(1f, plotBottom - plotTop);
+
+            var n = Math.Min(series.Length, Math.Max(2, cell.Width));
             if (n >= 2)
             {
                 var tail = series[^n..];
@@ -306,12 +367,13 @@ public sealed class TaskbarWidgetForm : Form
                 float YFor(double pct)
                 {
                     var t = Math.Clamp(pct / 100.0, 0.0, 1.0);
-                    return plot.Bottom - (float)(t * plot.Height);
+                    return plotBottom - (float)(t * plotH);
                 }
 
+                float span = Math.Max(0f, plotRight - plotLeft);
                 for (var i = 0; i < n; i++)
                 {
-                    var x = plot.Left + (plot.Width - 1) * (float)i / (n - 1);
+                    var x = n <= 1 ? plotLeft : plotLeft + span * i / (n - 1);
                     pts[i] = new PointF(x, YFor(tail[i]));
                 }
 
@@ -320,12 +382,78 @@ public sealed class TaskbarWidgetForm : Form
                 var latest = tail[^1];
                 var txt = $"{latest:0}%";
                 var szPct = g.MeasureString(txt, f);
-                DrawShadowString(g, txt, f, labelBr, cell.Right - szPct.Width - 2, cell.Bottom - szPct.Height - 2);
+                DrawShadowString(g, txt, f, labelBr, cell.Right - szPct.Width - 2f, cell.Bottom - szPct.Height - 2f);
             }
 
-            DrawShadowString(g, label, f, labelBr, cell.Left + 2, cell.Top + 2);
+            DrawShadowString(g, label, f, labelBr, cell.Left + 2f, cell.Top + 2f);
             if (subtitle is not null)
-                DrawShadowString(g, subtitle, fSub, labelBr, cell.Left + 2, cell.Top + 2 + f.Height - 1);
+                DrawShadowString(g, subtitle, fSub, labelBr, cell.Left + 2f, cell.Top + 2f + f.Height - 1f);
+        }
+        finally
+        {
+            g.Restore(state);
+        }
+    }
+
+    private void DrawDualGraph(
+        Graphics g,
+        Rectangle cell,
+        double[] seriesA,
+        double[] seriesB,
+        string label,
+        string aTag,
+        string bTag)
+    {
+        var aColor = Color.FromArgb(255, 90, 200, 255); // down
+        var bColor = Color.FromArgb(255, 255, 160, 90); // up
+        using var penA = new Pen(aColor, 2f);
+        using var penB = new Pen(bColor, 2f);
+        using var labelBr = new SolidBrush(LabelBrush);
+        using var f = new Font("Segoe UI", 7, FontStyle.Regular);
+        using var fSub = new Font("Segoe UI", 6.25f, FontStyle.Regular);
+
+        var state = g.Save();
+        try
+        {
+            g.SetClip(cell);
+
+            float plotLeft = cell.Left;
+            float plotRight = cell.Right - 1f;
+            float plotTop = cell.Top;
+            float plotBottom = cell.Bottom - 1f;
+            float plotH = Math.Max(1f, plotBottom - plotTop);
+            float span = Math.Max(0f, plotRight - plotLeft);
+
+            static PointF[] BuildPts(double[] series, int n, float left, float span, float bottom, float h)
+            {
+                var tail = series[^n..];
+                var pts = new PointF[n];
+                for (var i = 0; i < n; i++)
+                {
+                    var x = n <= 1 ? left : left + span * i / (n - 1);
+                    var t = Math.Clamp(tail[i] / 100.0, 0.0, 1.0);
+                    var y = bottom - (float)(t * h);
+                    pts[i] = new PointF(x, y);
+                }
+                return pts;
+            }
+
+            var nA = Math.Min(seriesA.Length, Math.Max(2, cell.Width));
+            if (nA >= 2)
+                g.DrawLines(penA, BuildPts(seriesA, nA, plotLeft, span, plotBottom, plotH));
+
+            var nB = Math.Min(seriesB.Length, Math.Max(2, cell.Width));
+            if (nB >= 2)
+                g.DrawLines(penB, BuildPts(seriesB, nB, plotLeft, span, plotBottom, plotH));
+
+            DrawShadowString(g, label, f, labelBr, cell.Left + 2f, cell.Top + 2f);
+            DrawShadowString(g, $"{aTag}/{bTag}", fSub, labelBr, cell.Left + 2f, cell.Top + 2f + f.Height - 1f);
+
+            var latestA = seriesA.Length > 0 ? seriesA[^1] : 0;
+            var latestB = seriesB.Length > 0 ? seriesB[^1] : 0;
+            var txt = $"{latestA:0}/{latestB:0}%";
+            var sz = g.MeasureString(txt, f);
+            DrawShadowString(g, txt, f, labelBr, cell.Right - sz.Width - 2f, cell.Bottom - sz.Height - 2f);
         }
         finally
         {
