@@ -14,8 +14,9 @@ public sealed class TaskbarWidgetForm : Form
     private readonly Metrics _metrics = new();
     private readonly RingBuffer _cpu = new(60);
     private readonly RingBuffer _mem = new(60);
-    private readonly RingBuffer _netDown = new(60);
-    private readonly RingBuffer _netUp = new(60);
+    // 10 minute history @ 1 sample/sec
+    private readonly RingBuffer _netDown = new(600);
+    private readonly RingBuffer _netUp = new(600);
     private readonly RingBuffer _diskSamples = new(60);
     private readonly SettingsStore _settings = new();
     private string[] _drives = ["C:\\"];
@@ -169,11 +170,11 @@ public sealed class TaskbarWidgetForm : Form
 
     private void SampleAndRedraw()
     {
-        var (cpu, mem, tempC, cpuMhz, netDownPct, netUpPct) = _metrics.Sample();
+        var (cpu, mem, tempC, cpuMhz, netDownBps, netUpBps) = _metrics.Sample();
         _cpu.Add(cpu);
         _mem.Add(mem);
-        _netDown.Add(netDownPct);
-        _netUp.Add(netUpPct);
+        _netDown.Add(netDownBps);
+        _netUp.Add(netUpBps);
         _cpuClockMhz = cpuMhz;
 
         // Probe temps continually, but only display when reliably present.
@@ -424,14 +425,20 @@ public sealed class TaskbarWidgetForm : Form
             float plotH = Math.Max(1f, plotBottom - plotTop);
             float span = Math.Max(0f, plotRight - plotLeft);
 
-            static PointF[] BuildPts(double[] series, int n, float left, float span, float bottom, float h)
+            // Scale to peak of last 10 minutes (max of either series).
+            var peak = 0.0;
+            for (var i = 0; i < seriesA.Length; i++) peak = Math.Max(peak, seriesA[i]);
+            for (var i = 0; i < seriesB.Length; i++) peak = Math.Max(peak, seriesB[i]);
+            if (!double.IsFinite(peak) || peak <= 1) peak = 1;
+
+            static PointF[] BuildPts(double[] series, int n, float left, float span, float bottom, float h, double peak)
             {
                 var tail = series[^n..];
                 var pts = new PointF[n];
                 for (var i = 0; i < n; i++)
                 {
                     var x = n <= 1 ? left : left + span * i / (n - 1);
-                    var t = Math.Clamp(tail[i] / 100.0, 0.0, 1.0);
+                    var t = Math.Clamp(tail[i] / peak, 0.0, 1.0);
                     var y = bottom - (float)(t * h);
                     pts[i] = new PointF(x, y);
                 }
@@ -440,18 +447,24 @@ public sealed class TaskbarWidgetForm : Form
 
             var nA = Math.Min(seriesA.Length, Math.Max(2, cell.Width));
             if (nA >= 2)
-                g.DrawLines(penA, BuildPts(seriesA, nA, plotLeft, span, plotBottom, plotH));
+                g.DrawLines(penA, BuildPts(seriesA, nA, plotLeft, span, plotBottom, plotH, peak));
 
             var nB = Math.Min(seriesB.Length, Math.Max(2, cell.Width));
             if (nB >= 2)
-                g.DrawLines(penB, BuildPts(seriesB, nB, plotLeft, span, plotBottom, plotH));
+                g.DrawLines(penB, BuildPts(seriesB, nB, plotLeft, span, plotBottom, plotH, peak));
 
             DrawShadowString(g, label, f, labelBr, cell.Left + 2f, cell.Top + 2f);
             DrawShadowString(g, $"{aTag}/{bTag}", fSub, labelBr, cell.Left + 2f, cell.Top + 2f + f.Height - 1f);
 
             var latestA = seriesA.Length > 0 ? seriesA[^1] : 0;
             var latestB = seriesB.Length > 0 ? seriesB[^1] : 0;
-            var txt = $"{latestA:0}/{latestB:0}%";
+            static string Fmt(double bps)
+            {
+                if (!double.IsFinite(bps) || bps < 0) bps = 0;
+                var mbps = (bps * 8.0) / 1_000_000.0;
+                return mbps >= 100 ? $"{mbps:0}M" : $"{mbps:0.0}M";
+            }
+            var txt = $"{Fmt(latestA)}/{Fmt(latestB)}";
             var sz = g.MeasureString(txt, f);
             DrawShadowString(g, txt, f, labelBr, cell.Right - sz.Width - 2f, cell.Bottom - sz.Height - 2f);
         }

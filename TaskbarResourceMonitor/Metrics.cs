@@ -39,7 +39,7 @@ internal sealed class Metrics : IDisposable
         try { _computer.Open(); } catch { /* optional */ }
     }
 
-    public (double cpu, double mem, double? tempC, double? cpuClockMhz, double netDownPct, double netUpPct) Sample()
+    public (double cpu, double mem, double? tempC, double? cpuClockMhz, double netDownBps, double netUpBps) Sample()
     {
         var cpu = Safe(() => (double)_cpuCounter.NextValue(), 0);
         var mem = Safe(GetMemPercent, 0);
@@ -52,9 +52,9 @@ internal sealed class Metrics : IDisposable
         }
 
         var mhz = CombineCpuMegahertzPreferred();
-        var (downPct, upPct) = SampleNetworkUtilizationPercent();
+        var (downBps, upBps) = SampleNetworkBytesPerSecond();
 
-        return (cpu, mem, _lastTempC, mhz, downPct, upPct);
+        return (cpu, mem, _lastTempC, mhz, downBps, upBps);
     }
 
     /// <summary>Prefer LHM (hardware poll), then live perf counters, then WMI nominal speed (slow path / cached).</summary>
@@ -269,7 +269,7 @@ internal sealed class Metrics : IDisposable
         }
     }
 
-    private (double downPct, double upPct) SampleNetworkUtilizationPercent()
+    private (double downBps, double upBps) SampleNetworkBytesPerSecond()
     {
         try
         {
@@ -301,13 +301,11 @@ internal sealed class Metrics : IDisposable
             _lastTxBytes = tx;
             _lastIfSpeedBits = speedBits;
 
-            if (speedBits <= 0) return (0, 0);
-
             var downBps = dRx / dt;
             var upBps = dTx / dt;
-            var downPct = Math.Clamp((downBps * 8.0) / speedBits * 100.0, 0.0, 100.0);
-            var upPct = Math.Clamp((upBps * 8.0) / speedBits * 100.0, 0.0, 100.0);
-            return (downPct, upPct);
+            if (!double.IsFinite(downBps) || downBps < 0) downBps = 0;
+            if (!double.IsFinite(upBps) || upBps < 0) upBps = 0;
+            return (downBps, upBps);
         }
         catch
         {
