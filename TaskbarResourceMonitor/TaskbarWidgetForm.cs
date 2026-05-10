@@ -18,12 +18,18 @@ public sealed class TaskbarWidgetForm : Form
     // 10 minute history @ 1 sample/sec
     private readonly RingBuffer _netDown = new(600);
     private readonly RingBuffer _netUp = new(600);
-    private readonly RingBuffer _diskSamples = new(60);
+    private RingBuffer[] _diskBuffers = [];
     private readonly SettingsStore _settings = new();
     private string[] _drives = ["C:\\"];
-    private int _driveIdx;
-    private (string root, double usedPercent)? _disk;
-    private int _diskTick;
+
+    private static readonly Color[] DiskLineColors =
+    [
+        Color.FromArgb(255, 185, 130, 255),
+        Color.FromArgb(255, 90, 220, 220),
+        Color.FromArgb(255, 255, 200, 90),
+        Color.FromArgb(255, 140, 220, 120),
+        Color.FromArgb(255, 255, 140, 200),
+    ];
 
     private double? _tempC;
     private int _consecutiveTempMisses;
@@ -98,6 +104,7 @@ public sealed class TaskbarWidgetForm : Form
         ContextMenuStrip = menu;
 
         BuildStorageMenu(storageMenu);
+        RebuildDiskBuffers();
     }
 
     private void BuildStorageMenu(ToolStripMenuItem storageMenu)
@@ -196,17 +203,14 @@ public sealed class TaskbarWidgetForm : Form
             }
         }
 
-        // Disk usage: cycle through selected drives every ~4 seconds
-        _diskTick++;
-        if (_diskTick % 4 == 0)
+        EnsureDiskBuffers();
+        if (_drives.Length == 0) _drives = ["C:\\"];
+
+        for (var i = 0; i < _drives.Length; i++)
         {
-            if (_drives.Length == 0) _drives = ["C:\\"];
-            _driveIdx = (_driveIdx + 1) % _drives.Length;
+            var usage = Storage.TryGetUsage(_drives[i]);
+            _diskBuffers[i].Add(usage is { } u ? u.usedPercent : 0);
         }
-        var root = _drives.Length > 0 ? _drives[_driveIdx % _drives.Length] : "C:\\";
-        var usage = Storage.TryGetUsage(root);
-        _disk = usage is { } u ? (root, u.usedPercent) : null;
-        _diskSamples.Add(_disk is { } d ? d.usedPercent : 0);
 
         Invalidate();
     }
@@ -214,11 +218,24 @@ public sealed class TaskbarWidgetForm : Form
     public void SetDrives(string[] drives)
     {
         _drives = (drives is { Length: > 0 }) ? drives : ["C:\\"];
-        _driveIdx = 0;
-        _diskTick = 0;
+        RebuildDiskBuffers();
         ApplyPreferredWidthFromDriveSelection();
         PositionNearTaskbar();
         Invalidate();
+    }
+
+    private void EnsureDiskBuffers()
+    {
+        if (_diskBuffers.Length == _drives.Length) return;
+        RebuildDiskBuffers();
+    }
+
+    private void RebuildDiskBuffers()
+    {
+        var n = Math.Max(1, _drives.Length);
+        _diskBuffers = new RingBuffer[n];
+        for (var i = 0; i < n; i++)
+            _diskBuffers[i] = new RingBuffer(60);
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -261,7 +278,7 @@ public sealed class TaskbarWidgetForm : Form
         DrawGraph(g, cpuRect, _cpu.Snapshot(), Color.FromArgb(255, 90, 220, 90), "CPU", cpuSpeed);
         DrawGraph(g, memRect, _mem.Snapshot(), Color.FromArgb(255, 110, 160, 255), "RAM");
         DrawDualGraph(g, netRect, _netDown.Snapshot(), _netUp.Snapshot(), "NET", "DL", "UL");
-        DrawDiskGraph(g, diskRect, _diskSamples.Snapshot(), _disk);
+        DrawMultiDiskGraph(g, diskRect);
 
         if (_showTemp && _tempC is { } t)
         {
@@ -308,25 +325,81 @@ public sealed class TaskbarWidgetForm : Form
         g.DrawString(text, font, fill, x, y);
     }
 
-    /// <summary>Third mini graph matching CPU/RAM; label shows rotating drive letter.</summary>
-    private void DrawDiskGraph(
-        Graphics g,
-        Rectangle rect,
-        double[] series,
-        (string root, double usedPercent)? disk)
+    /// <summary>One line per selected drive (0–100% usage), simultaneously — not time-shared rotation.</summary>
+    private void DrawMultiDiskGraph(Graphics g, Rectangle cell)
     {
-        var color = Color.FromArgb(255, 185, 130, 255);
-        string label = disk is { } d
-            ? $"DSK {d.root.TrimEnd('\\')}" // e.g. DSK C: or DSK D:
-            : "DSK";
+        using var labelBr = new SolidBrush(LabelBrush);
+        using var f = new Font("Segoe UI", 7, FontStyle.Regular);
+        using var fSub = new Font("Segoe UI", 6.25f, FontStyle.Regular);
 
-        if (disk is null)
+        var roots = _drives.Length > 0 ? _drives : ["C:\\"];
+        EnsureDiskBuffers();
+
+        var anyReady = roots.Any(r => Storage.TryGetUsage(r) is not null);
+        if (!anyReady)
         {
-            DrawGraphUnavailable(g, rect, label);
+            DrawGraphUnavailable(g, cell, "DSK");
             return;
         }
 
-        DrawGraph(g, rect, series, color, label);
+        var state = g.Save();
+        try
+        {
+            g.SetClip(cell);
+
+            float plotLeft = cell.Left;
+            float plotRight = cell.Right - 1f;
+            float plotTop = cell.Top;
+            float plotBottom = cell.Bottom - 1f;
+            float plotH = Math.Max(1f, plotBottom - plotTop);
+            float span = Math.Max(0f, plotRight - plotLeft);
+
+            static PointF[] BuildPctPts(double[] series, int n, float left, float span, float bottom, float h)
+            {
+                var tail = series[^n..];
+                var pts = new PointF[n];
+                for (var i = 0; i < n; i++)
+                {
+                    var x = n <= 1 ? left : left + span * i / (n - 1);
+                    var t = Math.Clamp(tail[i] / 100.0, 0.0, 1.0);
+                    var y = bottom - (float)(t * h);
+                    pts[i] = new PointF(x, y);
+                }
+                return pts;
+            }
+
+            var w = Math.Max(2, cell.Width);
+            for (var i = 0; i < roots.Length && i < _diskBuffers.Length; i++)
+            {
+                var series = _diskBuffers[i].Snapshot();
+                var n = Math.Min(series.Length, w);
+                if (n < 2) continue;
+
+                var col = DiskLineColors[i % DiskLineColors.Length];
+                using var pen = new Pen(col, roots.Length >= 4 ? 1.6f : 2f);
+                g.DrawLines(pen, BuildPctPts(series, n, plotLeft, span, plotBottom, plotH));
+            }
+
+            var letters = string.Join("+", roots.Select(r => r.TrimEnd('\\')));
+            DrawShadowString(g, "DSK", f, labelBr, cell.Left + 2f, cell.Top + 2f);
+            DrawShadowString(g, letters, fSub, labelBr, cell.Left + 2f, cell.Top + 2f + f.Height - 1f);
+
+            var latestParts = new List<string>(roots.Length);
+            for (var i = 0; i < roots.Length && i < _diskBuffers.Length; i++)
+            {
+                var snap = _diskBuffers[i].Snapshot();
+                var pct = snap.Length > 0 ? snap[^1] : 0;
+                latestParts.Add($"{pct:0}");
+            }
+
+            var pctTxt = string.Join("|", latestParts);
+            var szPct = g.MeasureString(pctTxt, f);
+            DrawShadowString(g, pctTxt, f, labelBr, cell.Right - szPct.Width - 2f, cell.Bottom - szPct.Height - 2f);
+        }
+        finally
+        {
+            g.Restore(state);
+        }
     }
 
     private void DrawGraphUnavailable(Graphics g, Rectangle cell, string label)
