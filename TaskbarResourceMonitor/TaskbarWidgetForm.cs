@@ -263,6 +263,10 @@ public sealed class TaskbarWidgetForm : Form
         var diskTotalW = stripW / 4 + diskBump;
         var maxDisk = Math.Max(stripW / 4, stripW - 3 * minTripleCol);
         diskTotalW = Math.Clamp(diskTotalW, stripW / 4, maxDisk);
+        // Storage graphs use half the previous disk strip width each (remainder goes to CPU/RAM/NET).
+        const int minDiskColPx = 28;
+        var nDrive = Math.Max(1, driveCount);
+        diskTotalW = Math.Max(minDiskColPx * nDrive, diskTotalW / 2);
         var rest = stripW - diskTotalW;
         var w1 = rest / 3;
         var w2 = rest / 3;
