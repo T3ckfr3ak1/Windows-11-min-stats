@@ -7,7 +7,8 @@ public sealed class TaskbarWidgetForm : Form
     /// <summary>Width for CPU+RAM + one rotating disk graph (client area).</summary>
     private const int BaseClientWidth = 404;
 
-    private const int ClientWidthExtraPerAdditionalDrive = 44;
+    /// <summary>Extra client width per drive beyond the first; applied to the disk column (not split across CPU/RAM/NET).</summary>
+    private const int ClientWidthExtraPerAdditionalDrive = 52;
 
     private const int WidgetHeight = 60;
 
@@ -216,6 +217,7 @@ public sealed class TaskbarWidgetForm : Form
         _driveIdx = 0;
         _diskTick = 0;
         ApplyPreferredWidthFromDriveSelection();
+        PositionNearTaskbar();
         Invalidate();
     }
 
@@ -237,15 +239,22 @@ public sealed class TaskbarWidgetForm : Form
         var tempW = _showTemp ? 44 : 0;
         const int tempPad = 4;
         var stripW = inner.Width - tempW - (tempW > 0 ? tempPad : 0);
-        var w1 = stripW / 4;
-        var w2 = stripW / 4;
-        var w3 = stripW / 4;
-        var w4 = stripW - w1 - w2 - w3;
+        // Extra monitors widen the widget; give that space to DSK so rotation stays readable (CPU/RAM/NET stay ~even thirds of the rest).
+        var driveCount = Math.Max(1, _drives.Length);
+        var diskBump = (driveCount - 1) * ClientWidthExtraPerAdditionalDrive;
+        const int minTripleCol = 46;
+        var diskW = stripW / 4 + diskBump;
+        var maxDisk = Math.Max(stripW / 4, stripW - 3 * minTripleCol);
+        diskW = Math.Clamp(diskW, stripW / 4, maxDisk);
+        var rest = stripW - diskW;
+        var w1 = rest / 3;
+        var w2 = rest / 3;
+        var w3 = rest - w1 - w2;
 
         var cpuRect = new Rectangle(inner.Left, inner.Top, w1, inner.Height);
         var memRect = new Rectangle(cpuRect.Right, inner.Top, w2, inner.Height);
         var netRect = new Rectangle(memRect.Right, inner.Top, w3, inner.Height);
-        var diskRect = new Rectangle(netRect.Right, inner.Top, w4, inner.Height);
+        var diskRect = new Rectangle(netRect.Right, inner.Top, diskW, inner.Height);
         var tempRect = new Rectangle(diskRect.Right + (tempW > 0 ? tempPad : 0), inner.Top, tempW, inner.Height);
 
         var cpuSpeed = FormatCpuSpeed(_cpuClockMhz);
